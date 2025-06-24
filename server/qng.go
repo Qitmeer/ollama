@@ -4,20 +4,20 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/llm"
-	"github.com/ollama/ollama/model/models/mllama"
 	"github.com/ollama/ollama/template"
+	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -92,6 +92,8 @@ func Pull(ctx context.Context, req *api.PullRequest) (int, interface{}, error) {
 }
 
 func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (int, interface{}, error) {
+	useStream := false
+	req.Stream = &useStream
 	checkpointStart := time.Now()
 	name := model.ParseName(req.Model)
 	if !name.IsValid() {
@@ -107,7 +109,7 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 		return http.StatusNotFound, nil, fmt.Errorf("model '%s' not found", req.Model)
 	}
 
-	model, err := GetModel(name.String())
+	m, err := GetModel(name.String())
 	if err != nil {
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
@@ -121,7 +123,7 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 
 	// expire the runner
 	if req.Prompt == "" && req.KeepAlive != nil && int(req.KeepAlive.Seconds()) == 0 {
-		sched.expireRunner(model)
+		sched.expireRunner(m)
 
 		return http.StatusOK, api.GenerateResponse{
 			Model:      req.Model,
@@ -133,12 +135,19 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 	}
 
 	if req.Raw && (req.Template != "" || req.System != "" || len(req.Context) > 0) {
-		return http.StatusBadRequest, nil, errors.New("raw mode does not support template, system, or context")
+		return http.StatusBadRequest, nil, fmt.Errorf("raw mode does not support template, system, or context")
 	}
 
-	caps := []Capability{CapabilityCompletion}
+	caps := []model.Capability{model.CapabilityCompletion}
 	if req.Suffix != "" {
-		caps = append(caps, CapabilityInsert)
+		caps = append(caps, model.CapabilityInsert)
+	}
+	if req.Think != nil && *req.Think {
+		caps = append(caps, model.CapabilityThinking)
+		// TODO(drifkin): consider adding a warning if it's false and the model
+		// doesn't support thinking. It's not strictly required, but it can be a
+		// hint that the user is on an older qwen3/r1 model that doesn't have an
+		// updated template supporting thinking
 	}
 
 	r, m, opts, err := scheduleRunner(ctx, name.String(), caps, req.Options, req.KeepAlive, sched)
@@ -160,34 +169,13 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 		}, nil
 	}
 
-	isMllama := checkMllamaModelFamily(model)
-	if isMllama && len(req.Images) > 1 {
-		return http.StatusBadRequest, nil, errors.New("this model only supports one image: more than one image sent")
+	if slices.Contains(m.Config.ModelFamilies, "mllama") && len(req.Images) > 1 {
+		return http.StatusBadRequest, nil, fmt.Errorf("this model only supports one image while more than one image requested")
 	}
 
 	images := make([]llm.ImageData, len(req.Images))
 	for i := range req.Images {
-		if isMllama && len(model.ProjectorPaths) > 0 {
-			data, opts, err := mllama.Preprocess(bytes.NewReader(req.Images[i]))
-			if err != nil {
-				return http.StatusInternalServerError, nil, errors.New("error processing image")
-			}
-
-			ar, ok := opts["aspectRatioIndex"].(int)
-			if !ok {
-				return http.StatusInternalServerError, nil, errors.New("error processing image")
-			}
-
-			buf := new(bytes.Buffer)
-			err = binary.Write(buf, binary.LittleEndian, data)
-			if err != nil {
-				return http.StatusInternalServerError, nil, errors.New("error processing image")
-			}
-
-			images[i] = llm.ImageData{ID: i, Data: buf.Bytes(), AspectRatioID: ar}
-		} else {
-			images[i] = llm.ImageData{ID: i, Data: req.Images[i]}
-		}
+		images[i] = llm.ImageData{ID: i, Data: req.Images[i]}
 	}
 
 	prompt := req.Prompt
@@ -218,14 +206,14 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 
 			for _, i := range images {
 				imgPrompt := ""
-				if isMllama {
-					imgPrompt = "<|image|>"
-				}
 				msgs = append(msgs, api.Message{Role: "user", Content: fmt.Sprintf("[img-%d]"+imgPrompt, i.ID)})
 			}
 
 			values.Messages = append(msgs, api.Message{Role: "user", Content: req.Prompt})
 		}
+
+		values.Think = req.Think != nil && *req.Think
+		values.IsThinkSet = req.Think != nil
 
 		var b bytes.Buffer
 		if req.Context != nil {
@@ -244,7 +232,14 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 		prompt = b.String()
 	}
 
-	slog.Debug("generate request", "images", len(images), "prompt", prompt)
+	var thinkingState *thinking.Parser
+	openingTag, closingTag := thinking.InferTags(m.Template.Template)
+	if req.Think != nil && *req.Think && openingTag != "" && closingTag != "" {
+		thinkingState = &thinking.Parser{
+			OpeningTag: openingTag,
+			ClosingTag: closingTag,
+		}
+	}
 
 	ch := make(chan any)
 	go func() {
@@ -258,11 +253,10 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 			Options: opts,
 		}, func(cr llm.CompletionResponse) {
 			res := api.GenerateResponse{
-				Model:      req.Model,
-				CreatedAt:  time.Now().UTC(),
-				Response:   cr.Content,
-				Done:       cr.Done,
-				DoneReason: cr.DoneReason,
+				Model:     req.Model,
+				CreatedAt: time.Now().UTC(),
+				Response:  cr.Content,
+				Done:      cr.Done,
 				Metrics: api.Metrics{
 					PromptEvalCount:    cr.PromptEvalCount,
 					PromptEvalDuration: cr.PromptEvalDuration,
@@ -271,11 +265,18 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 				},
 			}
 
+			if thinkingState != nil {
+				thinking, content := thinkingState.AddContent(cr.Content)
+				res.Thinking = thinking
+				res.Response = content
+			}
+
 			if _, err := sb.WriteString(cr.Content); err != nil {
 				ch <- gin.H{"error": err.Error()}
 			}
 
 			if cr.Done {
+				res.DoneReason = cr.DoneReason.String()
 				res.TotalDuration = time.Since(checkpointStart)
 				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
@@ -295,28 +296,37 @@ func Generate(ctx context.Context, req *api.GenerateRequest, sched *Scheduler) (
 		}
 	}()
 
-	var gr api.GenerateResponse
-	var sb strings.Builder
-	for rr := range ch {
-		switch t := rr.(type) {
-		case api.GenerateResponse:
-			sb.WriteString(t.Response)
-			gr = t
-		case gin.H:
-			msg, ok := t["error"].(string)
-			if !ok {
-				msg = "unexpected error format in response"
+	if req.Stream != nil && !*req.Stream {
+		var r api.GenerateResponse
+		var sbThinking strings.Builder
+		var sbContent strings.Builder
+		for rr := range ch {
+			switch t := rr.(type) {
+			case api.GenerateResponse:
+				sbThinking.WriteString(t.Thinking)
+				sbContent.WriteString(t.Response)
+				r = t
+			case gin.H:
+				msg, ok := t["error"].(string)
+				if !ok {
+					msg = "unexpected error format in response"
+				}
+
+				return http.StatusInternalServerError, nil, fmt.Errorf("%s", msg)
+			default:
+				return http.StatusInternalServerError, nil, errors.New("unexpected response")
 			}
-			return http.StatusInternalServerError, nil, errors.New(msg)
-		default:
-			return http.StatusInternalServerError, nil, errors.New("unexpected response")
 		}
+
+		r.Thinking = sbThinking.String()
+		r.Response = sbContent.String()
+
+		return http.StatusOK, r, nil
 	}
-	gr.Response = sb.String()
-	return http.StatusOK, gr, nil
+	return http.StatusInternalServerError, nil, errors.New("unexpected response")
 }
 
-func scheduleRunner(ctx context.Context, name string, caps []Capability, requestOpts map[string]any, keepAlive *api.Duration, sched *Scheduler) (llm.LlamaServer, *Model, *api.Options, error) {
+func scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration, sched *Scheduler) (llm.LlamaServer, *Model, *api.Options, error) {
 	if name == "" {
 		return nil, nil, nil, fmt.Errorf("model %w", errRequired)
 	}
@@ -324,6 +334,10 @@ func scheduleRunner(ctx context.Context, name string, caps []Capability, request
 	model, err := GetModel(name)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	if slices.Contains(model.Config.ModelFamilies, "mllama") && len(model.ProjectorPaths) > 0 {
+		return nil, nil, nil, fmt.Errorf("'llama3.2-vision' is no longer compatible with your version of Ollama and has been replaced by a newer version. To re-download, run 'ollama pull llama3.2-vision'")
 	}
 
 	if err := model.CheckCapabilities(caps...); err != nil {
