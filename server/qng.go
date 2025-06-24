@@ -15,6 +15,7 @@ import (
 	"github.com/ollama/ollama/types/model"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -358,4 +359,8 @@ func scheduleRunner(ctx context.Context, name string, caps []model.Capability, r
 	}
 
 	return runner.llama, model, &opts, nil
+}
+
+func AllowedHostsMiddleware(addr net.Addr) gin.HandlerFunc {
+	return allowedHostsMiddleware(addr)
 }
