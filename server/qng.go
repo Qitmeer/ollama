@@ -6,13 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/llm"
-	"github.com/ollama/ollama/template"
-	"github.com/ollama/ollama/thinking"
-	"github.com/ollama/ollama/types/errtypes"
-	"github.com/ollama/ollama/types/model"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -21,6 +14,14 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/template"
+	"github.com/ollama/ollama/thinking"
+	"github.com/ollama/ollama/types/errtypes"
+	"github.com/ollama/ollama/types/model"
 )
 
 func FixBlobs(dir string) error {
